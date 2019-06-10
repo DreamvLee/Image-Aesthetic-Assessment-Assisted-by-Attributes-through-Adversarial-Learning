@@ -7,10 +7,13 @@ import numpy
 import torch as t
 import torchvision as tv
 import tqdm
-from model import NetG, NetD
+from model import NetG, NetD,NetmyG
 from torchnet.meter import AverageValueMeter
 import dataset as mydataset
+import time
 import pandas as pd
+
+
 class Config(object):
     data_path = '/home/graydove/Datasets/AADB/originalSize_train/'  # 数据集存放路径
     lable_path = '/home/graydove/LXQ/AADB合并'
@@ -18,10 +21,10 @@ class Config(object):
     alltestlabel_path = "/home/graydove/LXQ/AADB_test"
     num_workers = 4  # 多进程加载数据所用的进程数
     image_size = 224  # 图片尺寸
-    batch_size = 128
-    max_epoch = 200
-    lr1 = 2e-4  # 生成器的学习率
-    lr2 = 2e-4  # 判别器的学习率
+    batch_size = 16
+    max_epoch = 1000
+    lr1 = 0.0004  # 生成器的学习率
+    lr2 = 0.0002  # 判别器的学习率
     beta1 = 0.5  # Adam优化器的beta1参数
     gpu = True  # 是否使用GPU
     nz = 1  # 噪声维度
@@ -29,7 +32,7 @@ class Config(object):
     ndf = 16  # 判别器feature map数
 
     save_path = 'imgs/'  # 生成图片保存路径
-    test_path ="/home/graydove/Datasets/AADB/originalSize_test/farm1_286_20013434330_d99ab6b9a0_b.jpg"
+    test_path = "/home/graydove/Datasets/AADB/originalSize_test/farm1_286_20013434330_d99ab6b9a0_b.jpg"
     vis = True  # 是否使用visdom可视化
     env = 'meixueGAN'  # visdom的env
     plot_every = 20  # 每间隔20 batch，visdom画图一次
@@ -40,7 +43,7 @@ class Config(object):
     save_every = 10  # 没10个epoch保存一次模型
     netd_path = None  # 'checkpoints/netd_.pth' #预训练模型
     netg_path = None  # 'checkpoints/netg_211.pth'
-    weidu =12
+    weidu = 12
     # 只测试不训练
     gen_img = 'result.png'
     # 从512张生成的图片中保存最好的64张
@@ -57,10 +60,10 @@ def train(**kwargs):
     for k_, v_ in kwargs.items():
         setattr(opt, k_, v_)
 
-    device=t.device('cuda') if opt.gpu else t.device('cpu')
+    device = t.device('cuda') if opt.gpu else t.device('cpu')
     if opt.vis:
         from visualize import Visualizer
-        vis = Visualizer(opt.env,server = "172.16.6.194")
+        vis = Visualizer(opt.env, server="172.16.6.194")
 
     # 数据
     transforms = tv.transforms.Compose([
@@ -69,8 +72,8 @@ def train(**kwargs):
         tv.transforms.ToTensor(),
         tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
-    dataset = mydataset.AADBDataset(opt.data_path,opt.lable_path,transforms = transforms)
-    #dataset = tv.datasets.ImageFolder(opt.data_path, transform=transforms)
+    dataset = mydataset.AADBDataset(opt.data_path, opt.lable_path, transforms=transforms)
+    # dataset = tv.datasets.ImageFolder(opt.data_path, transform=transforms)
     dataloader = t.utils.data.DataLoader(dataset,
                                          batch_size=opt.batch_size,
                                          shuffle=True,
@@ -79,7 +82,7 @@ def train(**kwargs):
                                          )
 
     # 网络
-    netg, netd = NetG(opt), NetD(opt)
+    netg, netd = NetmyG(opt), NetD(opt)
     map_location = lambda storage, loc: storage
     if opt.netd_path:
         netd.load_state_dict(t.load(opt.netd_path, map_location=map_location))
@@ -88,17 +91,18 @@ def train(**kwargs):
     netd.to(device)
     netg.to(device)
 
-
     # 定义优化器和损失
     optimizer_g = t.optim.Adam(netg.parameters(), opt.lr1, betas=(opt.beta1, 0.999))
     optimizer_d = t.optim.Adam(netd.parameters(), opt.lr2, betas=(opt.beta1, 0.999))
     criterion = t.nn.BCELoss().to(device)
+    # huber损失
+    huber = t.nn.SmoothL1Loss().to(device)
 
     # 真图片label为1，假图片label为0
     # noises为生成网络的输入
-    #TODO
-    true_labels = t.ones([opt.batch_size,opt.weidu]).to(device)
-    fake_labels = t.zeros([opt.batch_size,opt.weidu]).to(device)
+    # TODO
+    true_labels = t.ones([opt.batch_size, opt.weidu]).to(device)
+    fake_labels = t.zeros([opt.batch_size, opt.weidu]).to(device)
 
     # noises 为12维
     fix_noises = t.randn(opt.batch_size, opt.nz, 1, opt.weidu).to(device)
@@ -106,7 +110,7 @@ def train(**kwargs):
 
     errord_meter = AverageValueMeter()
     errorg_meter = AverageValueMeter()
-
+    errorgs_meter = AverageValueMeter()
 
     epochs = range(opt.max_epoch)
     for epoch in iter(epochs):
@@ -121,14 +125,16 @@ def train(**kwargs):
                 output = netd(real_img)
 
                 error_d_real = criterion(output, true_labels)
-                error_d_real.backward()
+                error_d_real.backward(retain_graph=True)
 
                 ## 尽可能把假图片判别为错误
                 noises.data.copy_(t.randn(opt.batch_size, opt.nz, 1, opt.weidu))
                 fake_img = netg(noises).detach()  # 根据噪声生成假图
                 output = netd(fake_img)
+
                 error_d_fake = criterion(output, fake_labels)
-                error_d_fake.backward()
+                error_d_fake.backward(retain_graph=True)
+
                 optimizer_d.step()
 
                 error_d = error_d_fake + error_d_real
@@ -142,9 +148,18 @@ def train(**kwargs):
                 fake_img = netg(noises)
                 output = netd(fake_img)
                 error_g = criterion(output, true_labels)
-                error_g.backward()
+                print(output.shape, true_labels.shape)
+                error_g.backward(retain_graph=True)
+                bb = noises.view(opt.batch_size,-1)
+
+                print (bb.shape)
+                error_s = huber(output, bb)
+                error_s.backward(retain_graph=True)
+
+                error_gs = error_s + error_g
                 optimizer_g.step()
                 errorg_meter.add(error_g.item())
+                errorgs_meter.add(error_gs.item())
 
             if opt.vis and ii % opt.plot_every == opt.plot_every - 1:
                 ## 可视化
@@ -155,17 +170,17 @@ def train(**kwargs):
                 vis.images(real_img.data.cpu().numpy()[:64] * 0.5 + 0.5, win='real')
                 vis.plot('errord', errord_meter.value()[0])
                 vis.plot('errorg', errorg_meter.value()[0])
+                vis.plot('errorgs', errorgs_meter.value()[0])
 
-        if (epoch+1) % opt.save_every == 0:
+        if (epoch + 1) % opt.save_every == 0:
             # 保存模型、图片
-
-           #tv.utils.save_image(fix_fake_imgs.data[:64], '%s/%s.png' % (opt.save_path, epoch), normalize=True,range=(-1, 1))
-
-            t.save(netd.state_dict(), 'checkpoints/netd_%s.pth' % epoch)
-            t.save(netg.state_dict(), 'checkpoints/netg_%s.pth' % epoch)
+            localtime = time.asctime(time.localtime(time.time()))
+            print("要保存了")
+            t.save(netd.state_dict(), 'chenck20190529/netd_%s.pth' % epoch)
+            t.save(netg.state_dict(), 'chenck20190529/netg_%s.pth' % epoch)
             errord_meter.reset()
             errorg_meter.reset()
-
+            errorgs_meter.reset()
 
 @t.no_grad()
 def generate(**kwargs):
@@ -174,8 +189,8 @@ def generate(**kwargs):
     """
     for k_, v_ in kwargs.items():
         setattr(opt, k_, v_)
-    
-    device=t.device('cuda') if opt.gpu else t.device('cpu')
+
+    device = t.device('cuda') if opt.gpu else t.device('cpu')
 
     netg, netd = NetG(opt).eval(), NetD(opt).eval()
     noises = t.randn(opt.gen_search_num, opt.nz, 1, opt.weidu).normal_(opt.gen_mean, opt.gen_std)
@@ -187,10 +202,9 @@ def generate(**kwargs):
     netd.to(device)
     netg.to(device)
 
-
     # 生成图片，并计算图片在判别器的分数
     fake_img = netg(noises)
-    fake_img = fake_img.view(opt.gen_search_num,3,224,224)
+    fake_img = fake_img.view(opt.gen_search_num, 3, 224, 224)
     scores = netd(fake_img).detach()
     tv.utils.save_image(t.stack(fake_img), opt.gen_img, normalize=True, range=(-1, 1))
     # 挑选最好的某几张
@@ -201,8 +215,15 @@ def generate(**kwargs):
     # 保存图片
     tv.utils.save_image(t.stack(result), opt.gen_img, normalize=True, range=(-1, 1))
 
+
 @t.no_grad()
 def singletest(**kwargs):
+    """
+    python main.py singletest --nogpu --vis=False --netd-path=checkpoints/netd_2199.pth
+
+    :param kwargs:
+    :return:
+    """
     for k_, v_ in kwargs.items():
         setattr(opt, k_, v_)
 
@@ -219,7 +240,7 @@ def singletest(**kwargs):
     array = numpy.asarray(data)
 
     array = t.from_numpy(array)
-    array = array.view(1,3,224,224).to(device)
+    array = array.view(1, 3, 224, 224).to(device)
 
     print (array.shape)
     netd = NetD(opt).eval()
@@ -228,10 +249,13 @@ def singletest(**kwargs):
     netd.to(device)
     getlabel = netd(array).double().detach()
     print (getlabel)
+
+
 @t.no_grad()
 def test(**kwargs):
     """
-    随机生成动漫头像，并根据netd的分数选择较好的
+    python main.py test --nogpu --vis=False --netd-path=checkpoints/netd_2199.pth    --gen-num=1 --batch_size=1
+
     """
     for k_, v_ in kwargs.items():
         setattr(opt, k_, v_)
@@ -244,14 +268,14 @@ def test(**kwargs):
         tv.transforms.ToTensor(),
         tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
-    datasettest = mydataset.AADBDatasetTest(opt.alltestdata_path,opt.alltestlabel_path, transforms=transforms)
+    datasettest = mydataset.AADBDatasetTest(opt.alltestdata_path, opt.alltestlabel_path, transforms=transforms)
     # dataset = tv.datasets.ImageFolder(opt.data_path, transform=transforms)
     dataloadertest = t.utils.data.DataLoader(datasettest,
-                                         batch_size=opt.batch_size,
-                                         shuffle=True,
-                                         num_workers=opt.num_workers,
-                                         drop_last=True
-                                         )
+                                             batch_size=opt.batch_size,
+                                             shuffle=True,
+                                             num_workers=opt.num_workers,
+                                             drop_last=True
+                                             )
     netd = NetD(opt).eval()
     map_location = lambda storage, loc: storage
     netd.load_state_dict(t.load(opt.netd_path, map_location=map_location))
@@ -263,10 +287,9 @@ def test(**kwargs):
         img224 = img.to(device)
         getlabel = netd(img224).double().detach()
         label = label.double()
-        error = error+ criterion(label,getlabel)
+        error = error + criterion(label, getlabel)
 
-    print (error/1000)
-
+    print (error / 1000)
 
     #
     # map_location = lambda storage, loc: storage
@@ -281,7 +304,9 @@ def test(**kwargs):
     # data = pd.DataFrame(fake_label)
     # data.to_csv("score.csv")
 
-    #print (fake_label)
+    # print (fake_label)
+
+
 @t.no_grad()
 def discriminator(**kwargs):
     """
@@ -294,7 +319,7 @@ def discriminator(**kwargs):
 
     netd = NetD(opt).eval()
     noises = t.randn(opt.gen_search_num, 3, 224, 224).normal_(opt.gen_mean, opt.gen_std)
-    #noises = t.randn(3, 3, 224).normal_(opt.gen_mean, opt.gen_std)
+    # noises = t.randn(3, 3, 224).normal_(opt.gen_mean, opt.gen_std)
     noises = noises.to(device)
 
     map_location = lambda storage, loc: storage
@@ -302,10 +327,9 @@ def discriminator(**kwargs):
 
     netd.to(device)
 
-
     # 生成图片，并计算图片在判别器的分数
     fake_label = netd(noises).detach()
-    #scores = netd(fake_img).detach()
+    # scores = netd(fake_img).detach()
     data = pd.DataFrame(fake_label)
     data.to_csv("score.csv")
 
@@ -317,6 +341,9 @@ def discriminator(**kwargs):
     #     result.append(fake_img.data[ii])
     # # 保存图片
     # tv.utils.save_image(t.stack(result), opt.gen_img, normalize=True, range=(-1, 1))
+
+
 if __name__ == '__main__':
     import fire
+
     fire.Fire()
